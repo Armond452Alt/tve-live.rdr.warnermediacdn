@@ -1,6 +1,9 @@
 import concurrent.futures
 import os
 import requests
+from flask import Flask, Response
+
+app = Flask(__name__)
 
 # Base parameters for Turner/WBD Akamai HLS endpoints
 DOMAINS = [
@@ -9,12 +12,8 @@ DOMAINS = [
     "turnerlive.cdn.turner.com"
 ]
 
-# Event ID / CP code range around known Turner allocations
 EVENT_IDS = range(2023175, 2024200)
-
 SLATE_TYPES = ["noslate", "slate"]
-
-# Standard profile filenames for Turner HLS streams
 PROFILES = [
     "VIDEO_1_5128000.m3u8",  # 1080p / High
     "VIDEO_0_3564000.m3u8",  # 720p / Mid
@@ -27,8 +26,6 @@ DEFAULT_HEADERS = {
     "Referer": "https://www.adultswim.com/",
     "Origin": "https://www.adultswim.com"
 }
-
-OUTPUT_PLAYLIST = os.path.expanduser("~/toonwest_active.m3u")
 
 def check_endpoint(url):
     headers = DEFAULT_HEADERS.copy()
@@ -44,36 +41,34 @@ def check_endpoint(url):
 
 def scan_toonwest_feeds():
     candidates = []
-    
-    # Generate candidate URLs across combinations
     for domain in DOMAINS:
         for event_id in EVENT_IDS:
             for slate in SLATE_TYPES:
                 for profile in PROFILES:
-                    url = f"https://{domain}/hls/live/{event_id}/toonwest/{slate}/{profile}"
-                    candidates.append(url)
+                    candidates.append(f"https://{domain}/hls/live/{event_id}/toonwest/{slate}/{profile}")
                     
-    print(f"Generated {len(candidates)} candidate URLs. Scanning with thread pool...")
-    
     working_feeds = []
-    # Use multi-threading to check hundreds of combinations in seconds
     with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
         futures = {executor.submit(check_endpoint, url): url for url in candidates}
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             if result:
-                print(f"  [LIVE FOUND] {result}")
                 working_feeds.append(result)
                 
-    print(f"\nScan complete. Found {len(working_feeds)} active stream(s).")
+    return working_feeds
+
+@app.route("/")
+@app.route("/toonwest.m3u")
+def generate_playlist():
+    feeds = scan_toonwest_feeds()
     
-    if working_feeds:
-        with open(OUTPUT_PLAYLIST, "w", encoding="utf-8") as f:
-            f.write("#EXTM3U\n\n")
-            for idx, stream_url in enumerate(working_feeds, 1):
-                f.write(f'#EXTINF:-1 tvg-id="CartoonNetworkWest.us" tvg-name="CN West Feed {idx}",Cartoon Network West (Feed {idx})\n')
-                f.write(f"{stream_url}\n\n")
-        print(f"Saved active endpoints to '{OUTPUT_PLAYLIST}'")
+    playlist_lines = ["#EXTM3U\n"]
+    for idx, stream_url in enumerate(feeds, 1):
+        playlist_lines.append(f'#EXTINF:-1 tvg-id="CartoonNetworkWest.us" tvg-name="CN West Feed {idx}",Cartoon Network West (Feed {idx})')
+        playlist_lines.append(f"{stream_url}\n")
+        
+    playlist_content = "\n".join(playlist_lines)
+    return Response(playlist_content, mimetype="audio/x-mpegurl")
 
 if __name__ == "__main__":
-    scan_toonwest_feeds()
+    app.run(host="0.0.0.0", port=5000)
