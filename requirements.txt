@@ -1,3 +1,6 @@
-flask
-requests
-gunicorn
+concurrent.future 
+os
+threading
+time
+requests 
+psycopg2
