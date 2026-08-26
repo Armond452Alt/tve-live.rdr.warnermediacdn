@@ -12,7 +12,7 @@ DOMAINS = [
     "turnerlive.cdn.turner.com"
 ]
 
-EVENT_IDS = range(2023175, 2024200)
+EVENT_IDS = range(2023175, 2026200)
 SLATE_TYPES = ["noslate", "slate"]
 PROFILES = [
     "VIDEO_1_5128000.m3u8",  # 1080p / High
