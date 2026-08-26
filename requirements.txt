@@ -1,6 +1,4 @@
-concurrent.futures
-os
-threading
-time
-requests 
-psycopg2
+flask
+gunicorn
+requests
+psycopg2-binary
