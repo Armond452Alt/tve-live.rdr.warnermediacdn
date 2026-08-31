@@ -1,141 +1,177 @@
-import concurrent.futures
 import os
+import sqlite3
 import threading
 import time
-import requests
-import psycopg2
-from psycopg2.extras import execute_values
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, Response, jsonify
+import requests
 
 app = Flask(__name__)
 
-# Neon DB Connection String
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", 
-    "postgresql://neondb_owner:npg_hgdH3uxfFc0X@ep-billowing-leaf-ax2m99uj-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require"
-)
+# Database configuration (supports SQLite locally or persistent disk path on Render)
+DB_PATH = os.environ.get("DB_PATH", "streams.db")
 
-DOMAINS = [
-    "turnerlive.warnermediacdn.com",
-    "tve-live-ctl.warnermediacdn.com",
-    "turnerlive.cdn.turner.com"
-]
+# CDN edge wildcards and Turner/WBD stream targets
+CDN_PROVIDERS = ["aka", "lln", "ctl", "cfl", "fna"]
+STREAM_NAMES = ["toonwest", "tooneast", "adultswim", "cartoonnetwork"]
+PATH_VARIANTS = ["noslate", "slate"]
 
-EVENT_IDS = range(2023175, 2024200)
-SLATE_TYPES = ["noslate", "slate"]
-PATH_TEMPLATES = [
-    "hls/live/{event_id}/toonwest/{slate}/index.m3u8",
-    "hls/live/{event_id}/toonwest/{slate}/master.m3u8",
-    "hls/live/{event_id}/toonwest/{slate}/VIDEO_1_5128000.m3u8",
-    "hls/live/{event_id}/toonwest/index.m3u8"
-]
+# Range of Akamai CP/Event IDs to scan
+START_ID = 2023150
+END_ID = 2023200
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Origin": "https://www.adultswim.com",
     "Referer": "https://www.adultswim.com/",
-    "Origin": "https://www.adultswim.com"
 }
 
+
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def init_db():
-    """Create the streams table if it does not exist."""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS active_streams (
-                id SERIAL PRIMARY KEY,
-                channel_name VARCHAR(100),
-                url TEXT UNIQUE NOT NULL,
-                last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"DB Init Error: {e}")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS active_streams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stream_name TEXT NOT NULL,
+            cdn_provider TEXT NOT NULL,
+            event_id INTEGER NOT NULL,
+            url TEXT UNIQUE NOT NULL,
+            status TEXT NOT NULL,
+            last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """
+    )
+    conn.commit()
+    conn.close()
 
-# Initialize DB table on boot
-init_db()
 
-def check_endpoint(url):
-    headers = DEFAULT_HEADERS.copy()
-    headers["Range"] = "bytes=0-512"
+def check_endpoint(args):
+    cdn, stream_name, event_id, path_variant = args
+    url = f"https://tve-live-{cdn}.warnermediacdn.com/hls/live/{event_id}/{stream_name}/{path_variant}/master.m3u8"
+
     try:
-        response = requests.get(url, headers=headers, timeout=2.5, stream=True)
-        if response.status_code in (200, 206):
-            chunk = next(response.iter_content(chunk_size=512), b"")
-            if b"#EXTM3U" in chunk or b"#EXTINF" in chunk:
-                return url
+        res = requests.get(
+            url, headers=DEFAULT_HEADERS, timeout=3, stream=True
+        )
+        # 200/206 = Open live stream
+        # 403 = Valid event ID exists, but requires Akamai hdnts token
+        if res.status_code in (200, 206):
+            return {
+                "stream_name": stream_name,
+                "cdn": cdn,
+                "event_id": event_id,
+                "url": url,
+                "status": "LIVE",
+            }
+        elif res.status_code == 403:
+            return {
+                "stream_name": stream_name,
+                "cdn": cdn,
+                "event_id": event_id,
+                "url": url,
+                "status": "EXISTS_TOKEN_REQUIRED",
+            }
     except Exception:
         pass
     return None
 
-def update_db_feeds():
-    """Background worker that scans candidate URLs and saves active ones to Neon DB."""
-    candidates = []
-    for domain in DOMAINS:
-        for event_id in EVENT_IDS:
-            for slate in SLATE_TYPES:
-                for path_tmpl in PATH_TEMPLATES:
-                    candidates.append(f"https://{domain}/" + path_tmpl.format(event_id=event_id, slate=slate))
 
-    # Keep thread pool moderate (20 max) to stay within Render's 512MB RAM cap
-    working_feeds = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        futures = {executor.submit(check_endpoint, url): url for url in candidates}
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res:
-                working_feeds.append(res)
+def run_background_scanner():
+    while True:
+        print("[Scanner] Starting sweep across WBD CDN matrix...")
+        tasks = []
+        for event_id in range(START_ID, END_ID + 1):
+            for stream in STREAM_NAMES:
+                for cdn in CDN_PROVIDERS:
+                    for variant in PATH_VARIANTS:
+                        tasks.append((cdn, stream, event_id, variant))
 
-    if working_feeds:
-        try:
+        results = []
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = executor.map(check_endpoint, tasks)
+            for res in futures:
+                if res:
+                    results.append(res)
+
+        # Save hits to database
+        if results:
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("TRUNCATE TABLE active_streams;")
-            records = [("Cartoon Network West", url) for url in working_feeds]
-            execute_values(cur, "INSERT INTO active_streams (channel_name, url) VALUES %s ON CONFLICT (url) DO NOTHING;", records)
+            for item in results:
+                cur.execute(
+                    """
+                    INSERT INTO active_streams (stream_name, cdn_provider, event_id, url, status, last_checked)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(url) DO UPDATE SET
+                        status = excluded.status,
+                        last_checked = CURRENT_TIMESTAMP;
+                """,
+                    (
+                        item["stream_name"],
+                        item["cdn"],
+                        item["event_id"],
+                        item["url"],
+                        item["status"],
+                    ),
+                )
             conn.commit()
-            cur.close()
             conn.close()
-        except Exception as e:
-            print(f"DB Update Error: {e}")
+            print(
+                f"[Scanner] Sweep complete. Found/updated {len(results)} active endpoints."
+            )
 
-def background_loop():
-    while True:
-        update_db_feeds()
-        time.sleep(900)  # Scan every 15 minutes
+        time.sleep(300)  # Re-scan every 5 minutes
 
-# Run thread in background
-threading.Thread(target=background_loop, daemon=True).start()
+
+# Initialize database and spin up background scanner thread
+init_db()
+scanner_thread = threading.Thread(target=run_background_scanner, daemon=True)
+scanner_thread.start()
+
 
 @app.route("/")
-@app.route("/toonwest.m3u")
-@app.route("/playlist.m3u")
 def generate_playlist():
-    feeds = []
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT stream_name, url, status FROM active_streams;")
+    rows = cur.fetchall()
+    conn.close()
+
+    m3u_content = "#EXTM3U\n"
+    for row in rows:
+        tag = " [TOKEN REQUIRED]" if row["status"] == "EXISTS_TOKEN_REQUIRED" else ""
+        m3u_content += f'#EXTINF:-1 tvg-name="{row["stream_name"]}",{row["stream_name"].upper()}{tag}\n'
+        m3u_content += f"{row['url']}\n"
+
+    return Response(m3u_content, mimetype="audio/x-mpegurl")
+
+
+@app.route("/status")
+def status_check():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT url FROM active_streams;")
-        rows = cur.fetchall()
-        feeds = [row[0] for row in rows]
+        cur.execute("SELECT count(*) FROM active_streams;")
+        total = cur.fetchone()[0]
+        cur.execute(
+            "SELECT count(*) FROM active_streams WHERE status = 'LIVE';"
+        )
+        live = cur.fetchone()[0]
         cur.close()
         conn.close()
+        return jsonify({"total_endpoints_found": total, "live_unlocked": live})
     except Exception as e:
-        print(f"DB Fetch Error: {e}")
+        return jsonify({"error": str(e)}), 500
 
-    playlist_lines = ["#EXTM3U\n"]
-    for idx, stream_url in enumerate(feeds, 1):
-        playlist_lines.append(f'#EXTINF:-1 tvg-id="CartoonNetworkWest.us" tvg-name="CN West Feed {idx}",Cartoon Network West (Feed {idx})')
-        playlist_lines.append(f"{stream_url}\n")
-
-    return Response("\n".join(playlist_lines), mimetype="audio/x-mpegurl")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
