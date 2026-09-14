@@ -2,6 +2,3 @@ flask
 gunicorn
 requests
 psycopg2-binary
-jsonify
-Response
-ThreadPoolExecutor
