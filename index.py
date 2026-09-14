@@ -18,7 +18,7 @@ PATH_VARIANTS = ["noslate", "slate"]
 
 # Range of Akamai CP/Event IDs to scan
 START_ID = 2023150
-END_ID = 2023200
+END_ID = 2026150
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
